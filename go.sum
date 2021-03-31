@@ -1,5 +1,5 @@
-github.com/coffeemakr/dns v1.1.41-proxy h1:LlUx3Z51QB/ULxt5byocfPKeMior7pRtWNoKsJiYsBE=
-github.com/coffeemakr/dns v1.1.41-proxy/go.mod h1:p6aan82bvRIyn+zDIv9xYNUpwa73JcSh9BKwknJysuI=
+github.com/miekg/dns v1.1.41 h1:WMszZWJG0XmzbK9FEmzH2TVcqYzFesusSIB41b8KHxY=
+github.com/miekg/dns v1.1.41/go.mod h1:p6aan82bvRIyn+zDIv9xYNUpwa73JcSh9BKwknJysuI=
 golang.org/x/net v0.0.0-20210226172049-e18ecbb05110/go.mod h1:m0MpNAwzfU5UDzcl9v0D8zg8gWTRqZa9RBIspLL5mdg=
 golang.org/x/net v0.0.0-20210326220855-61e056675ecf h1:WUcCxqQqDT0aXO4VnQbfMvp4zh7m1Gb2clVuHUAGGRE=
 golang.org/x/net v0.0.0-20210326220855-61e056675ecf/go.mod h1:uSPa2vr4CLtc/ILN5odXGNXS6mhrKVzTaCXzk9m6W3k=

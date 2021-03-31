@@ -6,5 +6,3 @@ require (
 	github.com/miekg/dns v1.1.41
 	golang.org/x/net v0.0.0-20210326220855-61e056675ecf
 )
-
-replace github.com/miekg/dns v1.1.41 => github.com/coffeemakr/dns v1.1.41-proxy

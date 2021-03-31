@@ -111,30 +111,48 @@ func failArgs(format string, a ...interface{}) {
 	os.Exit(1)
 }
 
-type serverArgs struct {
-	Network       string
+type DnsProtocol string
+
+const (
+	ProtocolTCP = DnsProtocol("tcp")
+	ProtocolUDP = DnsProtocol("udp")
+)
+
+type ServerConfig struct {
+	Protocol      DnsProtocol
+	UseTLS        bool
 	ServerHost    string
 	ServerPort    string
 	TlsServerName string
 }
 
-func parseServerArg(server string) (*serverArgs, error) {
+func (s ServerConfig) Address() string {
+	return s.ServerHost + ":" + s.ServerPort
+}
+
+func (s ServerConfig) Network() string {
+	return string(s.Protocol)
+}
+
+func parseServerArg(server string) (*ServerConfig, error) {
 	var defaultPort = "53"
 	var err error
-	var result = new(serverArgs)
+	var result = new(ServerConfig)
+	result.Protocol = "udp"
 	var schemeEnd = strings.Index(server, "://")
 	if schemeEnd > -1 {
 		scheme := server[:schemeEnd]
 		server = server[schemeEnd+3:]
 		switch scheme {
 		case "tls", "dot", "tcp-tls":
-			result.Network = "tcp-tls"
+			result.Protocol = ProtocolTCP
+			result.UseTLS = true
 			defaultPort = "853"
 		case "tcp":
-			result.Network = "tcp"
+			result.Protocol = ProtocolTCP
 			defaultPort = "53"
 		case "udp":
-			result.Network = "udp"
+			result.Protocol = ProtocolUDP
 			defaultPort = "53"
 		default:
 			return nil, fmt.Errorf("invalid scheme: %s", scheme)
@@ -159,21 +177,22 @@ func parseServerArg(server string) (*serverArgs, error) {
 		}
 	}
 
-	if result.Network == "" {
+	if result.Protocol == "" {
 		switch result.ServerPort {
 		case "853":
-			result.Network = "tcp-tls"
+			result.Protocol = ProtocolTCP
+			result.UseTLS = true
 		default:
 			fallthrough
 		case "53":
-			result.Network = "udp"
+			result.Protocol = ProtocolUDP
 		}
 	}
 	return result, nil
 }
 
-func parseProxyArg(proxyValue string) (dns.Dialer, error) {
-	var proxyDialer dns.Dialer
+func parseProxyArg(proxyValue string) (Dialer, error) {
+	var proxyDialer Dialer
 	proxyUrl, err := url.Parse(proxyValue)
 	if err != nil {
 		return nil, fmt.Errorf("invalid proxy url: %s", err)
@@ -185,12 +204,100 @@ func parseProxyArg(proxyValue string) (dns.Dialer, error) {
 	return proxyDialer, nil
 }
 
+// A Dialer is a means to establish a connection.
+type Dialer interface {
+	Dial(network, address string) (net.Conn, error)
+}
+
+type Scoop struct {
+	Dialer Dialer
+	TLSConfig *tls.Config
+}
+
+func (s Scoop) Exchange(server *ServerConfig, msg *dns.Msg) (*dns.Msg, error) {
+	conn, err := s.Dial(server)
+	if err != nil {
+		return nil, err
+	}
+	err = conn.WriteMsg(msg)
+	if err != nil {
+		closeError := conn.Close()
+		if closeError != nil {
+			return nil, fmt.Errorf("failed to close connection: %s - after error %s", closeError, err)
+		} else {
+			return nil, err
+		}
+	}
+	response, err := conn.ReadMsg()
+	if err != nil {
+		closeError := conn.Close()
+		if closeError != nil {
+			return nil, fmt.Errorf("failed to reaad connection: %s - after error %s", closeError, err)
+		} else {
+			return nil, err
+		}
+	}
+	return response, conn.Close()
+}
+
+func (s Scoop) Dial(server *ServerConfig) (*dns.Conn, error) {
+	var err error
+	address := server.Address()
+	network := server.Network()
+	conn := new(dns.Conn)
+	var dialer Dialer
+	if s.Dialer == nil {
+		dialer = &net.Dialer{}
+	} else {
+		dialer = s.Dialer
+	}
+
+	if server.UseTLS {
+		var rawCon net.Conn
+		var tlsConfig *tls.Config
+		var tlsConn *tls.Conn
+		if s.TLSConfig == nil {
+			tlsConfig = &tls.Config{}
+		} else {
+			tlsConfig = s.TLSConfig.Clone()
+		}
+		// Do not overwrite ServerName if specified in the tlsConfig already
+		if tlsConfig.ServerName == "" {
+			if server.TlsServerName != "" {
+				tlsConfig.ServerName = server.ServerHost
+			} else {
+				tlsConfig.ServerName, _, err = net.SplitHostPort(address)
+				if err != nil {
+					return nil, err
+				}
+			}
+		}
+		rawCon, err = dialer.Dial(network, address)
+		if err != nil {
+			return nil, err
+		}
+		tlsConn = tls.Client(rawCon, tlsConfig)
+		err = tlsConn.Handshake()
+		if err != nil {
+			return nil, err
+		}
+		conn.Conn = tlsConn
+	} else {
+		conn.Conn, err = dialer.Dial(network, address)
+		if err != nil {
+			return nil, err
+		}
+	}
+	return conn, nil
+}
+
+
 func main() {
 	var err error
 	var dnsTypeName string
 	var outputType string
 	var name string
-	var serverArg *serverArgs
+	var serverArg *ServerConfig
 	var args = os.Args[1:]
 	var proxyUrl string
 	for i := 0; i < len(args); i++ {
@@ -270,12 +377,13 @@ func main() {
 		if err != nil {
 			failArgs("failed to load resolv.conf: %s", err)
 		}
-		serverArg = new(serverArgs)
+		serverArg = new(ServerConfig)
 		serverArg.ServerHost = config.Servers[0]
 		serverArg.ServerPort = config.Port
+		serverArg.Protocol = ProtocolUDP
 	}
 	log.Printf("using server %s on port %s \n", serverArg.ServerHost, serverArg.ServerPort)
-	log.Printf("using network %s\n", serverArg.Network)
+	log.Printf("using network %s\n", serverArg.Network())
 	if dnsTypeName == "" {
 		var arpa string
 		arpa, err = dns.ReverseAddr(name)
@@ -292,29 +400,33 @@ func main() {
 	}
 	log.Printf("using dns type %s", dnsTypeName)
 
-	client := new(dns.Client)
+	scoop := new(Scoop)
 	if proxyUrl != "" {
-		client.Dialer, err = parseProxyArg(proxyUrl)
+		scoop.Dialer, err = parseProxyArg(proxyUrl)
 		if err != nil {
 			failArgs(err.Error())
 		}
 		log.Printf("using proxy %s\n", proxyUrl)
 	}
-	client.Net = serverArg.Network
 	if serverArg.TlsServerName == "" && isOnionAddress(serverArg.ServerHost) {
 		log.Println("skipping TLS verification for .onion host")
-		client.TLSConfig = &tls.Config{
+		scoop.TLSConfig = &tls.Config{
 			InsecureSkipVerify: true,
 		}
 	} else if serverArg.TlsServerName != "" {
-		client.TLSConfig = &tls.Config{
+		scoop.TLSConfig = &tls.Config{
 			ServerName: serverArg.TlsServerName,
 		}
 	}
 	m := new(dns.Msg)
 	m.SetQuestion(dns.Fqdn(name), dnsType)
 	m.RecursionDesired = true
-	response, _, err := client.Exchange(m, serverArg.ServerHost+":"+serverArg.ServerPort)
+
+	response, err := scoop.Exchange(serverArg, m)
+	if err != nil {
+		fmt.Println(err)
+		return
+	}
 	var writer DnsWriter = defaultWriter
 	switch outputType {
 	case "json":
