@@ -2,9 +2,11 @@ package main
 
 import (
 	"crypto/tls"
+	"encoding/json"
 	"fmt"
 	"github.com/miekg/dns"
 	"golang.org/x/net/proxy"
+	"io"
 	"log"
 	"net"
 	"net/url"
@@ -110,9 +112,9 @@ func failArgs(format string, a ...interface{}) {
 }
 
 type serverArgs struct {
-	Network    string
-	ServerHost string
-	ServerPort string
+	Network       string
+	ServerHost    string
+	ServerPort    string
 	TlsServerName string
 }
 
@@ -140,7 +142,7 @@ func parseServerArg(server string) (*serverArgs, error) {
 	}
 	tlsNameIndex := strings.IndexByte(server, '#')
 	if tlsNameIndex >= 0 {
-		result.TlsServerName = server[tlsNameIndex + 1:]
+		result.TlsServerName = server[tlsNameIndex+1:]
 		server = server[:tlsNameIndex]
 	}
 	if len(server) == 0 {
@@ -186,6 +188,7 @@ func parseProxyArg(proxyValue string) (dns.Dialer, error) {
 func main() {
 	var err error
 	var dnsTypeName string
+	var outputType string
 	var name string
 	var serverArg *serverArgs
 	var args = os.Args[1:]
@@ -205,12 +208,12 @@ func main() {
 			}
 
 			switch arg {
-				case "tor":
-					if proxyUrl != "" {
-						failArgs("proxy already specified")
-					}
-					proxyUrl = "socks5h://127.0.0.1:9050"
-					continue
+			case "tor":
+				if proxyUrl != "" {
+					failArgs("proxy already specified")
+				}
+				proxyUrl = "socks5h://127.0.0.1:9050"
+				continue
 			}
 
 			var argValue string
@@ -218,7 +221,7 @@ func main() {
 			if len(argParts) == 2 {
 				arg = argParts[0]
 				argValue = argParts[1]
-			} else if i + 1 == len(args) {
+			} else if i+1 == len(args) {
 				failArgs("'%s' expects a value or is invalid flag", arg)
 			} else {
 				i++
@@ -230,6 +233,11 @@ func main() {
 					failArgs("proxy already specified")
 				}
 				proxyUrl = argValue
+			case "out":
+				if outputType != "" {
+					failArgs("'out' type already specified")
+				}
+				outputType = argValue
 			default:
 				failArgs("invalid argument: %s", arg)
 			}
@@ -303,33 +311,101 @@ func main() {
 			ServerName: serverArg.TlsServerName,
 		}
 	}
- 	err = Run(client, name, serverArg.ServerHost + ":" + serverArg.ServerPort, dnsType)
+	m := new(dns.Msg)
+	m.SetQuestion(dns.Fqdn(name), dnsType)
+	m.RecursionDesired = true
+	response, _, err := client.Exchange(m, serverArg.ServerHost+":"+serverArg.ServerPort)
+	var writer DnsWriter = defaultWriter
+	switch outputType {
+	case "json":
+		writer = &jsonWriter{
+			Indent: "  ",
+		}
+
+	}
+	err = writer.Write(os.Stdout, response)
 	if err != nil {
 		fmt.Println(" *** error:", err)
 	}
 }
 
-func isOnionAddress(host string) bool {
-	return strings.HasSuffix(host, ".onion")
+type DnsWriter interface {
+	Write(w io.Writer, answer *dns.Msg) error
 }
 
-func Run(c *dns.Client, fqdn, server string, dnsType uint16) (err error) {
-	m := new(dns.Msg)
-	m.SetQuestion(dns.Fqdn(fqdn), dnsType)
-	m.RecursionDesired = true
-	r, _, err := c.Exchange(m, server)
-	if err != nil {
-		return fmt.Errorf("query failed: %s", err)
+type jsonWriter struct {
+	Prefix string
+	Indent string
+}
+
+func (writer jsonWriter) Write(w io.Writer, answer *dns.Msg) error {
+	encoder := json.NewEncoder(w)
+	encoder.SetIndent(writer.Prefix, writer.Indent)
+	err := encoder.Encode(answer)
+	return err
+}
+
+type writerFunc func(w io.Writer, answer *dns.Msg) error
+
+func (fnc writerFunc) Write(w io.Writer, answer *dns.Msg) error {
+	return fnc(w, answer)
+}
+
+var defaultWriter writerFunc = func(w io.Writer, answer *dns.Msg) (err error) {
+	const (
+		bold                  = "\033[1m"
+		unbold                = "\033[0m"
+		inlineFmt             = bold + "%-9s: " + unbold
+		headerFmt             = bold + "\n> %s " + unbold + "\n"
+		answerHighlightFormat = "\033[0;32m%v\u001B[0m\n"
+		answerFailFormat      = "\033[0;31m%v\u001B[0m\n"
+	)
+	if _, err = fmt.Fprintf(w, inlineFmt+"%s (%d)\n", "Rcode", dns.RcodeToString[answer.Rcode], answer.Rcode); err != nil {
+		return
 	}
-	if r.Rcode != dns.RcodeSuccess {
-		return fmt.Errorf("answer not successfull: %s", dns.RcodeToString[r.Rcode])
+	if _, err = fmt.Fprintf(w, inlineFmt+"%d\n", "Id", answer.Id); err != nil {
+		return
 	}
-	if len(r.Answer) == 0 {
-		return fmt.Errorf("no answers")
+	if _, err = fmt.Fprintf(w, inlineFmt+"%t\n", "Compress", answer.Compress); err != nil {
+		return
 	}
-	// Stuff must be in the answer section
-	for _, a := range r.Answer {
-		fmt.Printf("%v\n", a)
+	if len(answer.Ns) > 0 {
+		if _, err = fmt.Fprintf(w, headerFmt, "Nameservers"); err != nil {
+			return
+		}
+		for _, nameserver := range answer.Ns {
+			if _, err = fmt.Fprintf(w, "%v\n", nameserver); err != nil {
+				return
+			}
+		}
+	}
+	if len(answer.Extra) > 0 {
+		if _, err = fmt.Fprintf(w, headerFmt, "Extras"); err != nil {
+			return
+		}
+		for _, extra := range answer.Extra {
+			if _, err = fmt.Fprintf(w, "%v\n", extra); err != nil {
+				return
+			}
+		}
+	}
+
+	if _, err = fmt.Fprintf(w, headerFmt, "Answers"); err != nil {
+		return
+	}
+	if len(answer.Answer) == 0 {
+		if _, err = fmt.Fprintf(w, answerFailFormat, "no answers"); err != nil {
+			return
+		}
+	}
+	for _, answer := range answer.Answer {
+		if _, err = fmt.Fprintf(w, answerHighlightFormat, answer); err != nil {
+			return
+		}
 	}
 	return nil
+}
+
+func isOnionAddress(host string) bool {
+	return strings.HasSuffix(host, ".onion")
 }
